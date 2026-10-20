@@ -1,0 +1,17 @@
+*.exe
+*.pdb
+dist/
+build/
+__pycache__/
+*.pyc
+
+launcher-unlocker/bin/
+launcher-unlocker/obj/
+
+build_exe.bat
+*.spec
+
+.vs/
+.vscode/
+.idea/
+*.user
