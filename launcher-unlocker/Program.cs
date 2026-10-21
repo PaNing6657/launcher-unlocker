@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -241,6 +241,10 @@ static class Patcher
         var cehCtor = (IMethod)cehCtorIns.Operand;
         var callIns = ins[callIdx];
 
+        var iconCtorIns = FindOp(OpCodes.Newobj, "MyIconButton/ClickEventHandler::.ctor");
+        if (iconCtorIns == null) return false;
+        var iconCtor = (IMethod)iconCtorIns.Operand;
+
         var elseStart = In(OpCodes.Ldarg_0);
         var insert = new List<Instruction>
         {
@@ -249,18 +253,17 @@ static class Patcher
             In(OpCodes.Ldc_I4_2),              // ResourceTypes.ModPack
             In(OpCodes.Ceq),
             In(OpCodes.Brfalse, elseStart),
-            // 整合包：ClickHandler = Install_Click, SaveAs = Save_Click
+            // 整合包：安装 + 另存
             In(OpCodes.Ldarg_0),
             In(OpCodes.Ldftn, installClick),
             In(OpCodes.Newobj, cehCtor),
             In(OpCodes.Ldarg_0),
             In(OpCodes.Ldftn, saveClick),
-            In(OpCodes.Newobj, cehCtor),
+            In(OpCodes.Newobj, iconCtor),
             In(OpCodes.Ldloc_1),
             In(OpCodes.Br, callIns),
-            // 其他：原样
-            elseStart,
-            In(OpCodes.Ldarg_0),
+            // 其他：仅另存
+            elseStart,                        // 即 ldarg.0，委托的 target
             In(OpCodes.Ldftn, saveClick),
             In(OpCodes.Newobj, cehCtor),
             In(OpCodes.Ldnull),
@@ -397,8 +400,8 @@ static class Patcher
         if (curseForge == null || hmcl == null || mmc == null || mcbbs == null
             || modrinth == null || launcherPack == null || compress == null) return false;
 
-        const string srcPath = "ModModpack.vb";   // 只作日志里的来源文件名，不带本机绝对路径
-        var Lret = In(OpCodes.Ldloc, resultLocal);
+        const string srcPath = "ModModpack.vb";   // 仅作日志来源名
+        var Ltail = In(OpCodes.Ldloc, resultLocal);   // 返回值的收口点
 
         List<Instruction> Case(string log, MethodDef installer, int argc)
         {
@@ -416,7 +419,8 @@ static class Patcher
             if (argc >= 5) l.Add(In(OpCodes.Ldarg_2));   // Logo
             l.Add(In(OpCodes.Call, installer));
             l.Add(In(OpCodes.Stloc, resultLocal));
-            l.Add(In(OpCodes.Br, Lret));
+            // try 内须用 leave 退出
+            l.Add(In(OpCodes.Leave, Ltail));
             return l;
         }
 
@@ -428,7 +432,7 @@ static class Patcher
         var c9 = Case("整合包种类：带启动器的压缩包", launcherPack, 3);
         var cElse = Case("整合包种类：未能识别，假定为压缩包", compress, 2);
 
-        var dispatchFirst = In(OpCodes.Ldloc, packType);           // 分派入口（leave 目标）
+        // Case 0-4、9，其余按压缩包处理
         var switchTargets = new Instruction[10];
         switchTargets[0] = c0[0];
         switchTargets[1] = c1[0];
@@ -441,7 +445,7 @@ static class Patcher
         switchTargets[8] = cElse[0];
         switchTargets[9] = c9[0];
 
-        var tail = new List<Instruction> { dispatchFirst, In(OpCodes.Switch, switchTargets) };
+        var tail = new List<Instruction> { In(OpCodes.Switch, switchTargets) };
         tail.AddRange(cElse);
         tail.AddRange(c0);
         tail.AddRange(c1);
@@ -449,19 +453,21 @@ static class Patcher
         tail.AddRange(c3);
         tail.AddRange(c4);
         tail.AddRange(c9);
-        tail.Add(Lret);
-        tail.Add(In(OpCodes.Ret));
 
-        // 把「抛异常」改成 leave 到分派入口，并删除紧随的两条指令
-        ins[anchorIdx].OpCode = OpCodes.Leave;
-        ins[anchorIdx].Operand = dispatchFirst;
+        // 原「抛异常」处改为分派入口，删掉 newobj / throw
+        ins[anchorIdx].OpCode = OpCodes.Ldloc;
+        ins[anchorIdx].Operand = packType;
         ins.RemoveAt(anchorIdx + 2);
         ins.RemoveAt(anchorIdx + 1);
 
-        // 追加分派代码；原本到方法末尾的 finally 需要在此收口
-        foreach (var x in tail) ins.Add(x);
+        // 分派留在 try 内，保证 Archive 未被释放
+        for (int k = 0; k < tail.Count; k++) ins.Insert(anchorIdx + 1 + k, tail[k]);
+
+        // 收口放在 finally 之后
+        ins.Add(Ltail);
+        ins.Add(In(OpCodes.Ret));
         foreach (var eh in m.Body.ExceptionHandlers)
-            if (eh.HandlerEnd == null) eh.HandlerEnd = dispatchFirst;
+            if (eh.HandlerEnd == null) eh.HandlerEnd = Ltail;
 
         m.Body.UpdateInstructionOffsets();
         m.Body.KeepOldMaxStack = true;
